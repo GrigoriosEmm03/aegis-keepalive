@@ -1,0 +1,26 @@
+name: Keep AegisTrader awake
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours (sleep threshold ~12h -> large safety margin)
+  workflow_dispatch:          # manual trigger, for testing
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright + Chromium
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Wake the app
+        env:
+          STREAMLIT_APP_URL: ${{ secrets.STREAMLIT_APP_URL }}
+        run: python wake.py
