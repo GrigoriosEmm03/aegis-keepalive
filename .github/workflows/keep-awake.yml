@@ -1,26 +1,82 @@
 name: Keep AegisTrader awake
 
+# Streamlit Community Cloud hibernates an app after 12h without traffic.
+# GitHub's scheduler is best-effort: runs are delayed under load and single
+# slots are silently dropped. With the previous 6h cadence, two consecutive
+# misses were enough to exceed the 12h window (observed on 2026-08-28: the last
+# run fired at 01:50 UTC and the next two slots never fired). The cadence below
+# gives ~24 attempts per day, so the app can only fall asleep if six or more
+# consecutive slots are dropped.
 on:
   schedule:
-    - cron: "0 */6 * * *"   # every 6 hours (sleep threshold ~12h -> large safety margin)
-  workflow_dispatch:          # manual trigger, for testing
+    - cron: "11 */2 * * *"      # even hours at :11 UTC
+    - cron: "41 1-23/2 * * *"   # odd hours at :41 UTC
+  workflow_dispatch:            # manual trigger, for testing
+
+# contents: write is required by the heartbeat step below.
+permissions:
+  contents: write
+
+# Never run two wake jobs at the same time (delayed slots can pile up).
+concurrency:
+  group: keep-awake
+  cancel-in-progress: false
 
 jobs:
   keep-alive:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 15
 
-      - uses: actions/setup-python@v5
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Install Playwright + Chromium
         run: |
-          pip install playwright
+          pip install --upgrade playwright
           python -m playwright install --with-deps chromium
 
       - name: Wake the app
         env:
-          STREAMLIT_APP_URL: ${{ secrets.STREAMLIT_APP_URL }}
+          # Optional override; wake.py falls back to the hardcoded public URL,
+          # so a missing or renamed secret can no longer break the job.
+          STREAMLIT_APP_URL: ${{ vars.STREAMLIT_APP_URL || secrets.STREAMLIT_APP_URL }}
         run: python wake.py
+
+      - name: Upload debug screenshot on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wake-failure-${{ github.run_id }}
+          path: failure.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # GitHub disables scheduled workflows in a public repository after 60 days
+      # without repository activity. This step writes one heartbeat commit every
+      # ~45 days so the cron is never auto-disabled.
+      # Optional hardening: store a fine-grained PAT (contents: write) as the
+      # secret KEEPALIVE_PAT; the push is then authored by a real user account.
+      - name: Heartbeat commit (prevents the 60-day auto-disable)
+        if: ${{ always() && github.event_name == 'schedule' }}
+        env:
+          GH_PUSH_TOKEN: ${{ secrets.KEEPALIVE_PAT || github.token }}
+        run: |
+          set -euo pipefail
+          LAST_COMMIT_TS=$(git log -1 --format=%ct)
+          NOW_TS=$(date +%s)
+          AGE_DAYS=$(( (NOW_TS - LAST_COMMIT_TS) / 86400 ))
+          echo "Days since the last commit: ${AGE_DAYS}"
+          if [ "${AGE_DAYS}" -lt 45 ]; then
+            echo "Below the 45-day threshold - no heartbeat commit needed."
+            exit 0
+          fi
+          date -u '+%Y-%m-%dT%H:%M:%SZ keep-awake heartbeat' >> keepalive_log.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add keepalive_log.txt
+          git commit -m "chore: keep-alive heartbeat (prevents the 60-day schedule auto-disable)"
+          git push "https://x-access-token:${GH_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${GITHUB_REF_NAME}"
