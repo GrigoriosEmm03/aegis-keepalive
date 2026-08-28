@@ -10,11 +10,16 @@ This script therefore drives a headless Chromium instance and:
 
   1. opens the app (a real browser visit = real traffic, resets the 12h timer);
   2. detects the sleep page and clicks the wake button;
-  3. polls until the Streamlit app root is actually rendered, so a silent
-     failure cannot be reported as success;
-  4. stays connected for a few seconds so the WebSocket session is registered;
+  3. verifies that the Streamlit app itself is really rendered, so a silent
+     failure can no longer be reported as success;
+  4. stays connected for a few seconds so the session is registered;
   5. exits with a non-zero status if the app is still not running, which turns
      the GitHub Actions run red and triggers a failure notification.
+
+Important DOM detail (verified live on 2026-08-28): on *.streamlit.app the
+running app is served inside an iframe (src ".../~/+/"), while the sleep page
+lives in the top-level document. The app root ([data-testid="stApp"]) therefore
+has to be looked for in EVERY frame, not only in the main one.
 
 Configuration: STREAMLIT_APP_URL (optional; DEFAULT_APP_URL is used otherwise).
 """
@@ -38,18 +43,18 @@ from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sy
 DEFAULT_APP_URL = "https://aegistrader-ml-thesis-app.streamlit.app"
 APP_URL = (os.environ.get("STREAMLIT_APP_URL") or "").strip() or DEFAULT_APP_URL
 
-# Sleep page markers (matched case-insensitively so small wording changes on
-# Streamlit's side do not silently break the detection).
+# The sleep page renders a real <button> whose accessible name is
+# "Yes, get this app back up!" (verified live). Matched case-insensitively so
+# small wording changes on Streamlit's side do not break the detection.
 WAKE_BUTTON_RE = re.compile(r"get this app back up", re.IGNORECASE)
-SLEEP_TEXT_RE = re.compile(r"(gone to sleep|wake it back up|zzzz)", re.IGNORECASE)
 
-# Root element rendered by a running Streamlit app.
+# Root element rendered by a running Streamlit app (inside the app iframe).
 APP_ROOT_SELECTOR = "[data-testid='stApp'], .stApp"
 
 NAV_TIMEOUT_MS = 60_000      # page.goto timeout
-RENDER_WAIT_MS = 6_000       # let the client-side JS paint the sleep page
+READY_TIMEOUT_S = 90         # max wait to decide "running" vs "sleeping"
 BOOT_TIMEOUT_S = 300         # max wait for the container to boot after a click
-POLL_INTERVAL_S = 5          # polling granularity while booting
+POLL_INTERVAL_MS = 2_000     # polling granularity
 DWELL_S = 20                 # stay on the running app so the session is counted
 MAX_ATTEMPTS = 3             # full reload attempts before giving up
 FAILURE_SCREENSHOT = "failure.png"
@@ -66,45 +71,49 @@ def log(message: str) -> None:
 
 def wake_button(page: Page):
     """Return a locator for the wake button, or None if it is not on the page."""
-    # Preferred: role-based lookup (robust against DOM restructuring).
-    by_role = page.get_by_role("button", name=WAKE_BUTTON_RE)
-    if by_role.count() > 0:
-        return by_role.first
-    # Fallback: plain text lookup, in case the control is not a <button>.
-    by_text = page.get_by_text(WAKE_BUTTON_RE)
-    if by_text.count() > 0:
-        return by_text.first
+    try:
+        by_role = page.get_by_role("button", name=WAKE_BUTTON_RE)
+        if by_role.count() > 0:
+            return by_role.first
+        by_text = page.get_by_text(WAKE_BUTTON_RE)
+        if by_text.count() > 0:
+            return by_text.first
+    except Exception:  # noqa: BLE001 - a navigating page can raise transiently
+        return None
     return None
 
 
-def is_sleeping(page: Page) -> bool:
-    """True if the sleep page is displayed."""
-    if wake_button(page) is not None:
-        return True
-    try:
-        body_text = page.inner_text("body", timeout=5_000)
-    except PlaywrightTimeoutError:
-        return False
-    return bool(SLEEP_TEXT_RE.search(body_text))
+def app_root_visible(page: Page) -> bool:
+    """True if the Streamlit app root exists in ANY frame of the page."""
+    for frame in page.frames:
+        try:
+            if frame.locator(APP_ROOT_SELECTOR).count() > 0:
+                return True
+        except Exception:  # noqa: BLE001 - frame detached mid-check
+            continue
+    return False
 
 
-def is_running(page: Page) -> bool:
-    """True if the real Streamlit app (not the sleep page) is rendered."""
-    if is_sleeping(page):
-        return False
-    return page.locator(APP_ROOT_SELECTOR).count() > 0
-
-
-def wait_until_running(page: Page, timeout_s: int) -> bool:
-    """Poll until the app is rendered or the timeout expires."""
+def wait_for_state(page: Page, timeout_s: int, accept_sleeping: bool = True) -> str:
+    """Poll the page until it is 'running', 'sleeping', or the timeout expires."""
     deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if is_running(page):
-            return True
-        page.wait_for_timeout(POLL_INTERVAL_S * 1000)
-        remaining = int(deadline - time.monotonic())
-        log(f"  ... still booting ({remaining}s left)")
-    return is_running(page)
+    while True:
+        if app_root_visible(page):
+            return "running"
+        if accept_sleeping and wake_button(page) is not None:
+            return "sleeping"
+        if time.monotonic() >= deadline:
+            return "unknown"
+        page.wait_for_timeout(POLL_INTERVAL_MS)
+
+
+def describe(page: Page) -> str:
+    """Small diagnostic dump, printed when the page state cannot be determined."""
+    try:
+        frames = [f.url for f in page.frames]
+        return f"title={page.title()!r} url={page.url!r} frames={frames}"
+    except Exception as exc:  # noqa: BLE001
+        return f"<could not inspect the page: {exc!r}>"
 
 
 # --------------------------------------------------------------------------- #
@@ -116,28 +125,30 @@ def attempt(page: Page, attempt_no: int) -> bool:
     # domcontentloaded, NOT networkidle: Streamlit keeps a WebSocket open, so
     # the network never idles and networkidle would always time out.
     page.goto(APP_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-    page.wait_for_timeout(RENDER_WAIT_MS)
 
-    if is_sleeping(page):
+    state = wait_for_state(page, READY_TIMEOUT_S)
+
+    if state == "sleeping":
         button = wake_button(page)
         if button is None:
-            log("Sleep page detected but the wake button was not found - reloading.")
+            log("Sleep page detected but the wake button vanished - reloading.")
             return False
         log("Sleep page detected -> clicking 'Yes, get this app back up!'")
         button.click()
-        if not wait_until_running(page, BOOT_TIMEOUT_S):
-            log("App did not finish booting within the timeout.")
+        state = wait_for_state(page, BOOT_TIMEOUT_S, accept_sleeping=False)
+        if state != "running":
+            log("The app did not finish booting within the timeout.")
             return False
-        log("App is up again after the wake click.")
-    elif is_running(page):
-        log("App was already awake; this visit counts as traffic.")
+        log("The app is up again after the wake click.")
+    elif state == "running":
+        log("The app was already awake; this visit counts as traffic.")
     else:
-        log("Neither the sleep page nor the app root was found - reloading.")
+        log(f"Page state undetermined - reloading. {describe(page)}")
         return False
 
     # Keep the session open so Streamlit registers a genuine viewer session.
     page.wait_for_timeout(DWELL_S * 1000)
-    return is_running(page)
+    return app_root_visible(page)
 
 
 def main() -> None:
