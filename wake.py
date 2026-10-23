@@ -51,6 +51,11 @@ WAKE_BUTTON_RE = re.compile(r"get this app back up", re.IGNORECASE)
 # Root element rendered by a running Streamlit app (inside the app iframe).
 APP_ROOT_SELECTOR = "[data-testid='stApp'], .stApp"
 
+# When Streamlit Cloud cannot serve the app (crash, container restart, platform
+# issue) the app iframe points to this URL instead of ".../~/+/" (observed in
+# run #677 on 2026-10-23). The wake script cannot fix this state.
+CLOUD_ERROR_MARKER = "share.streamlit.io/error"
+
 NAV_TIMEOUT_MS = 60_000      # page.goto timeout
 READY_TIMEOUT_S = 90         # max wait to decide "running" vs "sleeping"
 BOOT_TIMEOUT_S = 300         # max wait for the container to boot after a click
@@ -58,6 +63,32 @@ POLL_INTERVAL_MS = 2_000     # polling granularity
 DWELL_S = 20                 # stay on the running app so the session is counted
 MAX_ATTEMPTS = 3             # full reload attempts before giving up
 FAILURE_SCREENSHOT = "failure.png"
+
+# Reason recorded for every failed attempt; the final report is built from it.
+FAILURE_REASONS: list[str] = []
+REASON_TEXT = {
+    "cloud_error": (
+        "Streamlit Cloud error page",
+        "The app URL served https://share.streamlit.io/error instead of the app. "
+        "The app is not sleeping, it is not being served: the wake script cannot fix this. "
+        "Check the logs in share.streamlit.io (Manage app). Often transient.",
+    ),
+    "boot_timeout": (
+        "App did not finish booting",
+        f"The wake button was clicked but the app root did not render within {BOOT_TIMEOUT_S}s.",
+    ),
+    "button_vanished": (
+        "Wake button disappeared",
+        "The sleep page was detected but the wake button could not be clicked.",
+    ),
+    "undetermined": (
+        "Page state undetermined",
+        "Neither the sleep page, the app root, nor the Streamlit Cloud error page was found. "
+        "Download the failure.png artifact to see what the browser rendered.",
+    ),
+    "timeout": ("Playwright timeout", "Navigation or an element lookup timed out."),
+    "exception": ("Unexpected script error", "See the traceback in the step log."),
+}
 
 
 def log(message: str) -> None:
@@ -116,6 +147,14 @@ def describe(page: Page) -> str:
         return f"<could not inspect the page: {exc!r}>"
 
 
+def cloud_error_page(page: Page) -> bool:
+    """True if any frame points to Streamlit Cloud's error page."""
+    try:
+        return any(CLOUD_ERROR_MARKER in (f.url or "") for f in page.frames)
+    except Exception:  # noqa: BLE001 - frame detached mid-check
+        return False
+
+
 # --------------------------------------------------------------------------- #
 # Main routine
 # --------------------------------------------------------------------------- #
@@ -132,18 +171,26 @@ def attempt(page: Page, attempt_no: int) -> bool:
         button = wake_button(page)
         if button is None:
             log("Sleep page detected but the wake button vanished - reloading.")
+            FAILURE_REASONS.append("button_vanished")
             return False
         log("Sleep page detected -> clicking 'Yes, get this app back up!'")
         button.click()
         state = wait_for_state(page, BOOT_TIMEOUT_S, accept_sleeping=False)
         if state != "running":
             log("The app did not finish booting within the timeout.")
+            FAILURE_REASONS.append("boot_timeout")
             return False
         log("The app is up again after the wake click.")
     elif state == "running":
         log("The app was already awake; this visit counts as traffic.")
+    elif cloud_error_page(page):
+        log("Streamlit Cloud is serving its ERROR PAGE (share.streamlit.io/error) "
+            f"instead of the app - reloading. {describe(page)}")
+        FAILURE_REASONS.append("cloud_error")
+        return False
     else:
         log(f"Page state undetermined - reloading. {describe(page)}")
+        FAILURE_REASONS.append("undetermined")
         return False
 
     # Keep the session open so Streamlit registers a genuine viewer session.
@@ -170,9 +217,11 @@ def main() -> None:
                 success = attempt(page, i)
             except PlaywrightTimeoutError as exc:
                 log(f"Timeout during attempt {i}: {exc}")
+                FAILURE_REASONS.append("timeout")
                 success = False
             except Exception as exc:  # noqa: BLE001 - never crash before the report
                 log(f"Unexpected error during attempt {i}: {exc!r}")
+                FAILURE_REASONS.append("exception")
                 success = False
             if success:
                 break
@@ -191,7 +240,14 @@ def main() -> None:
         browser.close()
 
     if not success:
-        sys.exit("FAILED: the app is not confirmed to be running.")
+        # The reason of the LAST attempt is the most up-to-date diagnosis.
+        reason = FAILURE_REASONS[-1] if FAILURE_REASONS else "undetermined"
+        title, detail = REASON_TEXT.get(reason, REASON_TEXT["undetermined"])
+        history = ", ".join(FAILURE_REASONS) or "n/a"
+        # "::error" lines become annotations on the run page and in the
+        # failure e-mail, so the cause is visible without opening the log.
+        print(f"::error title={title}::{detail} (attempts: {history})", flush=True)
+        sys.exit(f"FAILED: the app is not confirmed to be running - {title}.")
     log("SUCCESS: the app is running.")
 
 
