@@ -24,7 +24,9 @@ concurrency:
 
 jobs:
   keep-alive:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest migrates to Ubuntu 26 from 2026-10-19 (actions/runner-images#14748).
+    # Playwright's --with-deps install is validated on 24.04; revisit when Playwright supports 26.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
 
     steps:
